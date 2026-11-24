@@ -1,0 +1,1 @@
+# MP PHARMAI ### YOUR HEALTH, OUR PRIORITY  An integrated pharmacy management system.  ## Features - Public medicine search - Staff registration and login - Administrator approval of staff accounts - Medicine and stock management - Sales and purchases - Pharmacy branch management  ## Goal To improve medicine accessibility and pharmacy operations.README.md
