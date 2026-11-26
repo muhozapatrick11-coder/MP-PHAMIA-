@@ -6,12 +6,25 @@ const nodemailer = require('nodemailer');
 const { z } = require('zod');
 
 const roles = ['owner','admin','pharmacist','stock_controller','cashier','claims'];
+const ROLE_PERMISSIONS = {
+  owner: ['users:read','users:approve','users:manage','branches:read','branches:manage','billing:read','billing:manage','products:read','products:write','stock:read','stock:receive','stock:transfer','stock:safety','sales:read','sales:create','inspections:read','inspections:write','reports:expiry','audit:read'],
+  admin: ['users:read','branches:read','branches:manage','billing:read','billing:manage','products:read','products:write','stock:read','stock:receive','stock:transfer','stock:safety','sales:read','sales:create','inspections:read','inspections:write','reports:expiry','audit:read'],
+  pharmacist: ['branches:read','products:read','products:write','stock:read','stock:receive','stock:transfer','stock:safety','sales:read','sales:create','inspections:read','inspections:write','reports:expiry'],
+  stock_controller: ['branches:read','products:read','products:write','stock:read','stock:receive','stock:transfer','stock:safety','inspections:read','inspections:write','reports:expiry'],
+  cashier: ['branches:read','products:read','stock:read','sales:read','sales:create'],
+  claims: ['branches:read','products:read','stock:read','sales:read'],
+};
 const platformOwnerEmails = () => (process.env.PLATFORM_OWNER_EMAILS || '').split(',').map(v => v.trim().toLowerCase()).filter(Boolean);
 const paymentMode = () => process.env.PAYMENT_PROVIDER_MODE || 'disabled';
 const isDevTestPayments = () => paymentMode() === 'test' && process.env.NODE_ENV !== 'production';
 const isPlatformOwner = user => Boolean(user && platformOwnerEmails().includes(String(user.email || '').toLowerCase()));
 const money2 = n => Math.round(Number(n) * 100) / 100;
 const tokenHash = v => crypto.createHash('sha256').update(v).digest('hex');
+const safeEqual = (a, b) => {
+  const ba = Buffer.from(String(a || ''));
+  const bb = Buffer.from(String(b || ''));
+  return ba.length > 0 && ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
+};
 const asyncRoute = fn => (req,res,next) => Promise.resolve(fn(req,res,next)).catch(next);
 function mailer() {
   if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) return null;
@@ -50,12 +63,13 @@ module.exports = ({ pool }) => {
     const h = req.headers.authorization || '';
     if (!h.startsWith('Bearer ')) return res.status(401).json({error:'Authentication required.'});
     try {
-      const p = jwt.verify(h.slice(7), process.env.JWT_SECRET, { algorithms:['HS256'] });
-      const q = await pool.query(`SELECT id, organization_id, full_name, email, username, role, active, email_verified_at, approval_status
+      const p = jwt.verify(h.slice(7), process.env.JWT_SECRET, { algorithms:['HS256'], issuer:'trix-pharmacy' });
+      const q = await pool.query(`SELECT id, organization_id, full_name, email, username, role, active, email_verified_at, approval_status, token_version
         FROM users WHERE id=$1`, [p.sub]);
       const u = q.rows[0];
       if (!u || !u.active || u.approval_status !== 'approved' || !u.email_verified_at) return res.status(403).json({error:'Account is not approved or is inactive.'});
-      req.user = u; next();
+      if (p.tv !== undefined && Number(p.tv) !== Number(u.token_version)) return res.status(401).json({error:'Session has been revoked. Please sign in again.'});
+      req.user = { ...u, permissions: ROLE_PERMISSIONS[u.role] || [] }; next();
     } catch { return res.status(401).json({error:'Invalid or expired session.'}); }
   });
   const allow = (...permitted) => (req,res,next) => permitted.includes(req.user.role) ? next() : res.status(403).json({error:'Insufficient permissions.'});
@@ -76,7 +90,7 @@ module.exports = ({ pool }) => {
     const schema=z.object({fullName:z.string().trim().min(2).max(120),email:z.string().email().transform(v=>v.toLowerCase()),username:z.string().trim().min(3).max(40).regex(/^[a-zA-Z0-9_.-]+$/),phone:z.string().max(40).optional(),organizationName:z.string().trim().min(2).max(120),branchName:z.string().trim().min(2).max(120),password:z.string().min(12).max(128),bootstrapSecret:z.string().min(20)});
     const d=schema.parse(req.body);
     const ownerEmail=String(process.env.ADMIN_EMAIL||'').toLowerCase();
-    if(!ownerEmail || d.email!==ownerEmail || !process.env.ADMIN_BOOTSTRAP_SECRET || d.bootstrapSecret!==process.env.ADMIN_BOOTSTRAP_SECRET) return res.status(403).json({error:'Administrator setup details are not valid.'});
+    if(!ownerEmail || d.email!==ownerEmail || !process.env.ADMIN_BOOTSTRAP_SECRET || !safeEqual(d.bootstrapSecret, process.env.ADMIN_BOOTSTRAP_SECRET)) return res.status(403).json({error:'Administrator setup details are not valid.'});
     const client=await pool.connect();
     try {
       await client.query('BEGIN');
@@ -127,8 +141,23 @@ module.exports = ({ pool }) => {
     if (u.approval_status==='pending' || !u.active) return res.status(403).json({error:'Your account is awaiting administrator approval.'});
     if (u.approval_status!=='approved') return res.status(403).json({error:'Your account has not been approved. Contact the administrator.'});
     if (!u.email_verified_at) return res.status(403).json({error:'Account verification is incomplete. Contact the administrator.'});
-    const accessToken=jwt.sign({sub:u.id,org:u.organization_id,role:u.role},process.env.JWT_SECRET,{algorithm:'HS256',expiresIn:'30m',issuer:'trix-pharmacy'});
-    res.json({accessToken,tokenType:'Bearer',expiresIn:1800,user:{id:u.id,name:u.full_name,email:u.email,username:u.username,role:u.role,organizationId:u.organization_id}});
+    const accessToken=jwt.sign({sub:u.id,org:u.organization_id,role:u.role,tv:u.token_version||1},process.env.JWT_SECRET,{algorithm:'HS256',expiresIn:'30m',issuer:'trix-pharmacy'});
+    res.json({accessToken,tokenType:'Bearer',expiresIn:1800,user:{id:u.id,name:u.full_name,email:u.email,username:u.username,role:u.role,organizationId:u.organization_id,permissions:ROLE_PERMISSIONS[u.role]||[]}});
+  }));
+
+  r.post('/auth/logout', auth, asyncRoute(async (req,res) => {
+    await pool.query('UPDATE users SET token_version=token_version+1 WHERE id=$1', [req.user.id]);
+    res.json({ message: 'Signed out and session token revoked.' });
+  }));
+
+  r.post('/auth/change-password', auth, asyncRoute(async (req,res) => {
+    const d=z.object({currentPassword:z.string().min(1).max(128),newPassword:z.string().min(12).max(128)}).parse(req.body);
+    const q=await pool.query('SELECT password_hash FROM users WHERE id=$1',[req.user.id]);
+    if(!q.rowCount || !(await bcrypt.compare(d.currentPassword, q.rows[0].password_hash))) return res.status(401).json({error:'Current password is incorrect.'});
+    const hash=await bcrypt.hash(d.newPassword,12);
+    await pool.query('UPDATE users SET password_hash=$1, token_version=token_version+1 WHERE id=$2',[hash,req.user.id]);
+    await pool.query("INSERT INTO audit_logs(organization_id,user_id,action,entity_type,entity_id) VALUES($1,$2,'password_changed','user',$2)",[req.user.organization_id,req.user.id]);
+    res.json({message:'Password changed and all previous sessions revoked. Please sign in again.'});
   }));
 
   r.post('/auth/forgot-password', asyncRoute(async (req,res) => {
@@ -151,7 +180,7 @@ module.exports = ({ pool }) => {
       const q=await client.query('SELECT id,user_id FROM password_reset_tokens WHERE token_hash=$1 AND used_at IS NULL AND expires_at>now() FOR UPDATE',[tokenHash(d.token)]);
       if(!q.rowCount){await client.query('ROLLBACK');return res.status(400).json({error:'Reset token is invalid or expired.'})}
       const hash=await bcrypt.hash(d.newPassword,12);
-      await client.query('UPDATE users SET password_hash=$1 WHERE id=$2',[hash,q.rows[0].user_id]);
+      await client.query('UPDATE users SET password_hash=$1, token_version=token_version+1 WHERE id=$2',[hash,q.rows[0].user_id]);
       await client.query('UPDATE password_reset_tokens SET used_at=now() WHERE user_id=$1 AND used_at IS NULL',[q.rows[0].user_id]);
       await client.query('COMMIT');res.json({message:'Password updated. Sign in again.'});
     } catch(e){await client.query('ROLLBACK');throw e} finally{client.release()}
@@ -169,12 +198,45 @@ module.exports = ({ pool }) => {
     }
   }));
 
+  r.get('/admin/users',auth,allow('owner','admin'),asyncRoute(async(req,res)=>{
+    const q=await pool.query(`SELECT u.id,u.full_name,u.username,u.email,u.phone,u.role,u.active,u.approval_status,u.requested_role,u.created_at,
+      COALESCE(json_agg(json_build_object('id',b.id,'code',b.code,'name',b.name)) FILTER (WHERE b.id IS NOT NULL),'[]') AS branches
+      FROM users u LEFT JOIN user_branch_access uba ON uba.user_id=u.id LEFT JOIN branches b ON b.id=uba.branch_id AND b.active=true
+      WHERE u.organization_id=$1 GROUP BY u.id ORDER BY u.created_at`,[req.user.organization_id]);
+    res.json({users:q.rows});
+  }));
+  r.patch('/admin/users/:userId',auth,allow('owner'),asyncRoute(async(req,res)=>{
+    const d=z.object({role:z.enum(roles).optional(),active:z.boolean().optional(),approvalStatus:z.enum(['approved','suspended','rejected']).optional()}).refine(v=>v.role!==undefined||v.active!==undefined||v.approvalStatus!==undefined,{message:'Provide at least one field to update.'}).parse(req.body);
+    const client=await pool.connect();
+    try{
+      await client.query('BEGIN');
+      const target=(await client.query('SELECT id,role,active,approval_status FROM users WHERE id=$1 AND organization_id=$2 FOR UPDATE',[req.params.userId,req.user.organization_id])).rows[0];
+      if(!target){await client.query('ROLLBACK');return res.status(404).json({error:'User not found in this organization.'});}
+      const nextRole=d.role??target.role;
+      const nextActive=d.active??target.active;
+      const nextStatus=d.approvalStatus??target.approval_status;
+      if(target.role==='owner'&&(nextRole!=='owner'||!nextActive||nextStatus!=='approved')){
+        const owners=await client.query("SELECT COUNT(*)::int AS n FROM users WHERE organization_id=$1 AND role='owner' AND active=true AND approval_status='approved'",[req.user.organization_id]);
+        if(owners.rows[0].n<=1){await client.query('ROLLBACK');return res.status(409).json({error:'Cannot demote or deactivate the last active owner.'});}
+      }
+      const updated=(await client.query('UPDATE users SET role=$1,active=$2,approval_status=$3,token_version=token_version+1 WHERE id=$4 RETURNING id,full_name,email,username,role,active,approval_status',[nextRole,nextActive,nextStatus,target.id])).rows[0];
+      await client.query("INSERT INTO audit_logs(organization_id,user_id,action,entity_type,entity_id,details) VALUES($1,$2,'staff_account_updated','user',$3,$4)",[req.user.organization_id,req.user.id,target.id,JSON.stringify({role:nextRole,active:nextActive,approvalStatus:nextStatus})]);
+      await client.query('COMMIT');
+      res.json({message:'Staff account updated and active sessions refreshed.',user:updated});
+    }catch(e){await client.query('ROLLBACK');throw e}finally{client.release()}
+  }));
   r.get('/admin/users/pending',auth,allow('owner','admin'),asyncRoute(async(req,res)=>{
     const q=await pool.query("SELECT id,full_name,username,email,phone,requested_role,created_at FROM users WHERE organization_id=$1 AND approval_status='pending' ORDER BY created_at",[req.user.organization_id]);
     res.json({users:q.rows});
   }));
   r.post('/admin/users/:userId/approve',auth,allow('owner'),asyncRoute(async(req,res)=>{
     const d=z.object({role:z.enum(['admin','pharmacist','stock_controller','cashier','claims'])}).parse(req.body);
+    const subLimits=(await pool.query('SELECT p.limits FROM subscriptions s JOIN plans p ON p.code=s.plan_code WHERE s.organization_id=$1',[req.user.organization_id])).rows[0]?.limits||{};
+    const maxUsers=Number(subLimits.max_users);
+    if(Number.isFinite(maxUsers)&&maxUsers>=0){
+      const activeUsers=await pool.query("SELECT COUNT(*)::int AS n FROM users WHERE organization_id=$1 AND active=true AND approval_status='approved'",[req.user.organization_id]);
+      if(activeUsers.rows[0].n>=maxUsers)return res.status(403).json({code:'PLAN_LIMIT_REACHED',limit:'max_users',max:maxUsers,error:`Your current plan allows ${maxUsers} active user account(s). Upgrade to approve more staff.`});
+    }
     const q=await pool.query("UPDATE users SET role=$1,active=true,approval_status='approved',email_verified_at=COALESCE(email_verified_at,now()) WHERE id=$2 AND organization_id=$3 AND approval_status='pending' RETURNING id,full_name,email,role",[d.role,req.params.userId,req.user.organization_id]);
     if(!q.rowCount)return res.status(404).json({error:'Pending user not found.'});
     await pool.query("INSERT INTO audit_logs(organization_id,user_id,action,entity_type,entity_id,details) VALUES($1,$2,'staff_account_approved','user',$3,$4)",[req.user.organization_id,req.user.id,q.rows[0].id,JSON.stringify({role:d.role})]);
@@ -208,7 +270,7 @@ module.exports = ({ pool }) => {
     res.json({subscription:sub,message:sub.access_allowed?'Subscription is active.':'Subscription has expired. Choose the limited Free plan or pay to renew.'});
   }));
 
-  r.get('/billing/summary',auth,asyncRoute(async(req,res)=>{
+  r.get('/billing/summary',auth,allow('owner','admin'),asyncRoute(async(req,res)=>{
     const sub=await getSubscription(req.user.organization_id);
     const payments=await pool.query(`SELECT id,plan_code,billing_interval,amount,currency,provider,status,provider_tx_ref,metadata,paid_at,created_at
       FROM payments WHERE organization_id=$1 ORDER BY created_at DESC LIMIT 20`,[req.user.organization_id]);
@@ -327,7 +389,7 @@ module.exports = ({ pool }) => {
   r.get('/billing/flutterwave/callback',asyncRoute(async(req,res)=>{
     const txRef=String(req.query.tx_ref||'');
     const transactionId=String(req.query.transaction_id||'');
-    if(req.query.status!=='successful'||!txRef||!transactionId) { if(txRef) await pool.query("UPDATE payments SET status='failed',updated_at=now() WHERE provider_tx_ref=$1 AND provider='flutterwave' AND status='pending'",[txRef]); return res.redirect('/?payment=failed'); }
+    if(req.query.status!=='successful'||!txRef||!transactionId) { return res.redirect('/?payment=failed'); }
     const payment=(await pool.query('SELECT provider,provider_tx_ref FROM payments WHERE provider_tx_ref=$1',[txRef])).rows[0];
     if(!payment||payment.provider!=='flutterwave') return res.redirect('/?payment=failed');
     try { const verified=await verifyFlutterwaveTransaction(transactionId,txRef); await activateVerifiedPayment(txRef,verified,transactionId); return res.redirect('/?payment=success'); }
@@ -356,7 +418,7 @@ module.exports = ({ pool }) => {
     const txRef=String(req.query.tx_ref||'');
     const p=(await pool.query(`SELECT provider_tx_ref,plan_code,billing_interval,amount,currency,status FROM payments WHERE provider_tx_ref=$1 AND provider='test'`,[txRef])).rows[0];
     if(!p||p.status!=='pending') return res.status(404).send('Test payment not found or already processed.');
-    res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>TRIX Test Checkout</title><style>body{font:16px system-ui;background:#f4f8f7;color:#18343a;display:grid;place-items:center;min-height:100vh;margin:0}.card{background:white;border:1px solid #dbe6e5;border-radius:16px;padding:28px;max-width:480px;margin:20px}.tag{color:#8a4b00;background:#fff1cc;padding:5px 9px;border-radius:99px;font-size:12px;font-weight:bold}button{background:#087f78;color:white;border:0;border-radius:9px;padding:12px 16px;font-weight:bold;cursor:pointer}</style></head><body><main class="card"><span class="tag">DEVELOPMENT TEST ONLY</span><h1>MP PHARMAI checkout</h1><p>Plan: <strong>${p.plan_code.toUpperCase()}</strong> · ${p.billing_interval}</p><p>Amount: <strong>${Number(p.amount).toLocaleString()} ${p.currency.trim()}</strong></p><p>No real money will be charged. Use this screen only to test the server-side payment and subscription flow.</p><button id="pay">Simulate successful test payment</button><p id="status" role="status"></p><script>document.getElementById('pay').onclick=async()=>{const b=document.getElementById('pay');b.disabled=true;document.getElementById('status').textContent='Processing test event…';try{const r=await fetch('/api/billing/test/complete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tx_ref:${json.dumps(txRef)}})});const d=await r.json();if(!r.ok)throw Error(d.error||'Test payment failed');location.href='/?payment=success&mode=test'}catch(e){document.getElementById('status').textContent=e.message;b.disabled=false}}</script></main></body></html>`);
+    res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>TRIX Test Checkout</title><style>body{font:16px system-ui;background:#f4f8f7;color:#18343a;display:grid;place-items:center;min-height:100vh;margin:0}.card{background:white;border:1px solid #dbe6e5;border-radius:16px;padding:28px;max-width:480px;margin:20px}.tag{color:#8a4b00;background:#fff1cc;padding:5px 9px;border-radius:99px;font-size:12px;font-weight:bold}button{background:#087f78;color:white;border:0;border-radius:9px;padding:12px 16px;font-weight:bold;cursor:pointer}</style></head><body><main class="card"><span class="tag">DEVELOPMENT TEST ONLY</span><h1>MP PHARMAI checkout</h1><p>Plan: <strong>${p.plan_code.toUpperCase()}</strong> · ${p.billing_interval}</p><p>Amount: <strong>${Number(p.amount).toLocaleString()} ${p.currency.trim()}</strong></p><p>No real money will be charged. Use this screen only to test the server-side payment and subscription flow.</p><button id="pay">Simulate successful test payment</button><p id="status" role="status"></p><script>document.getElementById('pay').onclick=async()=>{const b=document.getElementById('pay');b.disabled=true;document.getElementById('status').textContent='Processing test event…';try{const r=await fetch('/api/billing/test/complete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tx_ref:${JSON.stringify(txRef)}})});const d=await r.json();if(!r.ok)throw Error(d.error||'Test payment failed');location.href='/?payment=success&mode=test'}catch(e){document.getElementById('status').textContent=e.message;b.disabled=false}}</script></main></body></html>`);
   }));
   r.post('/billing/test/complete',asyncRoute(async(req,res)=>{
     if(!isDevTestPayments()) return res.status(404).json({error:'Not found.'});
@@ -399,7 +461,7 @@ module.exports = ({ pool }) => {
     res.json({summary,subscriptions:subs,recentPayments:recent});
   }));
 
-  r.post('/subscription/renew-request',auth,asyncRoute(async(req,res)=>{
+  r.post('/subscription/renew-request',auth,allow('owner','admin'),asyncRoute(async(req,res)=>{
     const d=z.object({plan:z.enum(['premium','business']).default('premium')}).parse(req.body||{});
     const q=await pool.query(`INSERT INTO subscription_renewal_requests(organization_id,requested_by,requested_plan)
       VALUES($1,$2,$3) RETURNING id,requested_plan,status,created_at`,[req.user.organization_id,req.user.id,d.plan]);
@@ -450,14 +512,27 @@ module.exports = ({ pool }) => {
     await pool.query('INSERT INTO user_branch_access(user_id,branch_id) VALUES($1,$2) ON CONFLICT DO NOTHING',[d.userId,req.params.branchId]);
     res.status(201).json({message:'Branch access assigned.'});
   }));
+  r.delete('/branches/:branchId/access/:userId',auth,allow('owner','admin'),asyncRoute(async(req,res)=>{
+    const check=await pool.query('SELECT id FROM branches WHERE id=$1 AND organization_id=$2',[req.params.branchId,req.user.organization_id]);
+    const user=await pool.query('SELECT id FROM users WHERE id=$1 AND organization_id=$2',[req.params.userId,req.user.organization_id]);
+    if(!check.rowCount||!user.rowCount)return res.status(404).json({error:'Branch or user not found in this organization.'});
+    await pool.query('DELETE FROM user_branch_access WHERE user_id=$1 AND branch_id=$2',[req.params.userId,req.params.branchId]);
+    res.json({message:'Branch access revoked.'});
+  }));
+  r.get('/audit-logs',auth,allow('owner','admin'),asyncRoute(async(req,res)=>{
+    const q=await pool.query(`SELECT a.id,a.action,a.entity_type,a.entity_id,a.details,a.created_at,u.full_name AS actor_name,u.role AS actor_role,b.name AS branch_name
+      FROM audit_logs a LEFT JOIN users u ON u.id=a.user_id LEFT JOIN branches b ON b.id=a.branch_id
+      WHERE a.organization_id=$1 ORDER BY a.created_at DESC LIMIT 150`,[req.user.organization_id]);
+    res.json({logs:q.rows});
+  }));
 
   r.get('/products/lookup',auth,asyncRoute(async(req,res)=>{
     const code=String(req.query.barcode||'').trim();
     if(!code||code.length>100)return res.status(400).json({error:'A valid barcode is required.'});
     const q=await pool.query(`SELECT p.id,p.name,p.generic_name,p.strength,p.dosage_form,p.barcode,p.sku,
       COALESCE(json_agg(json_build_object('batchId',sb.id,'branchId',sb.branch_id,'batchNumber',sb.batch_number,'expiryDate',sb.expiry_date,'quantity',sb.quantity_on_hand,'status',sb.status)) FILTER (WHERE sb.id IS NOT NULL),'[]') AS batches
-      FROM products p LEFT JOIN stock_batches sb ON sb.product_id=p.id AND sb.organization_id=p.organization_id
-      WHERE p.organization_id=$1 AND (p.barcode=$2 OR p.sku=$2) GROUP BY p.id`,[req.user.organization_id,code]);
+      FROM products p LEFT JOIN user_branch_access uba ON uba.user_id=$3 LEFT JOIN stock_batches sb ON sb.product_id=p.id AND sb.organization_id=p.organization_id AND sb.branch_id=uba.branch_id
+      WHERE p.organization_id=$1 AND (p.barcode=$2 OR p.sku=$2) GROUP BY p.id`,[req.user.organization_id,code,req.user.id]);
     if(!q.rowCount)return res.status(404).json({error:'Barcode not found in the verified product catalogue.'});
     res.json({product:q.rows[0]});
   }));
@@ -524,7 +599,7 @@ module.exports = ({ pool }) => {
     }catch(e){await client.query('ROLLBACK');throw e}finally{client.release()}
   }));
 
-  r.get('/sales',auth,allow('owner','admin','pharmacist','cashier'),asyncRoute(async(req,res)=>{
+  r.get('/sales',auth,allow('owner','admin','pharmacist','cashier','claims'),asyncRoute(async(req,res)=>{
     const branchId=String(req.query.branchId||'');
     if(!z.string().uuid().safeParse(branchId).success)return res.status(400).json({error:'A valid branchId is required.'});
     const access=await pool.query('SELECT 1 FROM user_branch_access WHERE user_id=$1 AND branch_id=$2',[req.user.id,branchId]);
@@ -553,12 +628,12 @@ module.exports = ({ pool }) => {
       }
       let total=0,locked=[];
       for(const item of d.items){
-        const q=await client.query(`SELECT sb.*,p.name FROM stock_batches sb JOIN products p ON p.id=sb.product_id
+        const q=await client.query(`SELECT sb.*,p.name,(sb.expiry_date < CURRENT_DATE) AS is_expired FROM stock_batches sb JOIN products p ON p.id=sb.product_id
           WHERE sb.id=$1 AND sb.branch_id=$2 AND sb.organization_id=$3 FOR UPDATE`,[item.batchId,d.branchId,req.user.organization_id]);
         if(!q.rowCount)throw Object.assign(new Error('Batch not found at this branch.'),{status:404});
         const b=q.rows[0];
         if(b.status!=='available')throw Object.assign(new Error('Batch is not available for sale.'),{status:409});
-        if(new Date(b.expiry_date+'T00:00:00Z')<new Date(new Date().toISOString().slice(0,10)+'T00:00:00Z'))throw Object.assign(new Error('Expired batch blocked.'),{status:409});
+        if(b.is_expired)throw Object.assign(new Error('Expired batch blocked.'),{status:409});
         if(b.quantity_on_hand<item.quantity)throw Object.assign(new Error(`Insufficient stock for ${b.name}.`),{status:409});
         await client.query('UPDATE stock_batches SET quantity_on_hand=quantity_on_hand-$1 WHERE id=$2',[item.quantity,b.id]);
         total+=Number(b.unit_price)*item.quantity;locked.push({batch:b,item});
@@ -587,10 +662,10 @@ module.exports = ({ pool }) => {
       const transfer=(await client.query(`INSERT INTO stock_transfers(organization_id,source_branch_id,destination_branch_id,requested_by,note)
         VALUES($1,$2,$3,$4,$5) RETURNING *`,[req.user.organization_id,...ids,req.user.id,d.note||null])).rows[0];
       for(const item of d.items){
-        const q=await client.query(`SELECT * FROM stock_batches WHERE id=$1 AND branch_id=$2 AND organization_id=$3 FOR UPDATE`,[item.batchId,d.sourceBranchId,req.user.organization_id]);
+        const q=await client.query(`SELECT *,(expiry_date < CURRENT_DATE) AS is_expired FROM stock_batches WHERE id=$1 AND branch_id=$2 AND organization_id=$3 FOR UPDATE`,[item.batchId,d.sourceBranchId,req.user.organization_id]);
         if(!q.rowCount)throw Object.assign(new Error('Source batch not found.'),{status:404});
         const b=q.rows[0];
-        if(b.status!=='available'||new Date(b.expiry_date+'T00:00:00Z')<new Date(new Date().toISOString().slice(0,10)+'T00:00:00Z'))throw Object.assign(new Error('Unavailable or expired stock cannot be transferred.'),{status:409});
+        if(b.status!=='available'||b.is_expired)throw Object.assign(new Error('Unavailable or expired stock cannot be transferred.'),{status:409});
         if(b.quantity_on_hand<item.quantity)throw Object.assign(new Error('Insufficient source stock.'),{status:409});
         await client.query('UPDATE stock_batches SET quantity_on_hand=quantity_on_hand-$1 WHERE id=$2',[item.quantity,b.id]);
         await client.query(`INSERT INTO stock_transfer_items(transfer_id,source_batch_id,product_id,batch_number,expiry_date,quantity,unit_cost,unit_price)
@@ -634,7 +709,7 @@ module.exports = ({ pool }) => {
       await client.query('COMMIT');res.json({message:'Transfer received.',transferId:t.id});
     }catch(e){await client.query('ROLLBACK');throw e}finally{client.release()}
   }));
-  r.get('/reports/expiry',auth,asyncRoute(async(req,res)=>{
+  r.get('/reports/expiry',auth,allow('owner','admin','pharmacist','stock_controller'),asyncRoute(async(req,res)=>{
     const q=await pool.query(`SELECT b.id,b.branch_id,p.name,p.strength,b.batch_number,b.quantity_on_hand,b.expiry_date,
       (b.expiry_date-CURRENT_DATE) AS days_left,b.status FROM stock_batches b JOIN products p ON p.id=b.product_id
       JOIN user_branch_access uba ON uba.branch_id=b.branch_id AND uba.user_id=$2
@@ -706,7 +781,7 @@ module.exports = ({ pool }) => {
       await client.query('COMMIT');res.status(201).json({inspection:row});
     }catch(e){await client.query('ROLLBACK');throw e}finally{client.release()}
   }));
-  r.get('/inspections',auth,asyncRoute(async(req,res)=>{
+  r.get('/inspections',auth,allow('owner','admin','pharmacist','stock_controller'),asyncRoute(async(req,res)=>{
     const branchId=String(req.query.branchId||'');
     if(!branchId)return res.status(400).json({error:'branchId is required.'});
     const access=await pool.query('SELECT 1 FROM user_branch_access WHERE user_id=$1 AND branch_id=$2',[req.user.id,branchId]);

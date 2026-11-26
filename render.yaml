@@ -9,6 +9,8 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      - key: TRUST_PROXY
+        value: "1"
       - key: PAYMENT_PROVIDER_MODE
         value: flutterwave
       - key: DATABASE_URL

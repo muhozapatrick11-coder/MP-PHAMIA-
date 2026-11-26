@@ -8,6 +8,7 @@
     "dev": "node --watch src/server.js",
     "check": "node --check src/server.js && node --check src/routes.js && node scripts/check-frontend.js && node --check scripts/migrate.js && node --check scripts/test-billing-e2e.js",
     "migrate": "node scripts/migrate.js",
+    "seed": "node scripts/seed.js",
     "test:billing": "node scripts/test-billing-e2e.js"
   },
   "engines": {

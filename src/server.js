@@ -10,12 +10,36 @@ if (!process.env.DATABASE_URL || !process.env.JWT_SECRET || process.env.JWT_SECR
   console.error('DATABASE_URL and a JWT_SECRET of at least 32 characters are required.');
   process.exit(1);
 }
-const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: true } : false });
+const useSsl = process.env.NODE_ENV === 'production' || process.env.PGSSLMODE === 'require' || /sslmode=require/i.test(process.env.DATABASE_URL);
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: useSsl ? { rejectUnauthorized: process.env.PGSSL_REJECT_UNAUTHORIZED !== 'false' } : false,
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
+});
+pool.on('error', err => console.error('Unexpected PostgreSQL pool error:', err.message));
 const app = express();
 app.disable('x-powered-by');
 // Enable only when the service is deployed behind a trusted reverse proxy (e.g. Render).
 if (process.env.TRUST_PROXY === '1') app.set('trust proxy', 1);
-app.use(helmet());
+app.use(helmet({
+  // Inline scripts/handlers are currently used across the static HTML pages.
+  // Keep strict defaults on framing/objects/base-uri; remove 'unsafe-inline' once scripts are externalized.
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrcAttr: ["'unsafe-inline'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      imgSrc: ["'self'", 'data:', 'blob:'],
+      connectSrc: ["'self'"],
+      objectSrc: ["'none'"],
+      baseUri: ["'self'"],
+      frameAncestors: ["'none'"],
+    },
+  },
+}));
 const allowedOrigins = (process.env.APP_ORIGIN || 'http://localhost:3000').split(',').map(v => v.trim()).filter(Boolean);
 app.use(cors({ origin: (origin, callback) => {
   // Allow non-browser clients with no Origin header; browser origins must be explicitly listed.
@@ -26,6 +50,18 @@ app.use(express.json({ limit: '100kb', verify: (req, res, buf) => { req.rawBody 
 // Apply a general API ceiling plus a stricter authentication ceiling. Tune after observing real traffic.
 app.use('/api', rateLimit({ windowMs: 15 * 60 * 1000, limit: 300, standardHeaders: true, legacyHeaders: false }));
 app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, standardHeaders: true, legacyHeaders: false }));
+app.get('/api', (_req, res) => {
+  res.json({
+    ok: true,
+    service: 'mp-pharmai-api',
+    version: '0.2.0',
+    endpoints: {
+      health: '/api/health',
+      plans: '/api/plans',
+      publicAvailability: '/api/public/availability',
+    },
+  });
+});
 // Register health before the API router so the router's auth middleware cannot intercept it.
 app.get('/api/health', async (_req, res) => {
   try { await pool.query('SELECT 1'); res.json({ ok: true, service: 'mp-pharmai-api' }); }
@@ -38,6 +74,12 @@ app.get('/', (_req, res) => res.sendFile(require('path').join(publicDir, 'client
 app.use(express.static(publicDir));
 app.use((err, _req, res, _next) => {
   console.error(err.message);
+  if (err.name === 'ZodError') {
+    const first = err.issues?.[0];
+    const detail = first ? `${first.path?.join('.') || 'input'}: ${first.message}` : 'Invalid request payload.';
+    return res.status(400).json({ error: `Validation failed (${detail}).` });
+  }
+  if (err.code === '22P02') return res.status(400).json({ error: 'Invalid identifier or value format.' });
   if (err.code === '23505') return res.status(409).json({ error: 'A record with those unique details already exists.' });
   res.status(err.status || 500).json({ error: err.status ? err.message : 'Unexpected server error.' });
 });

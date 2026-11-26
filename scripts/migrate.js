@@ -13,7 +13,7 @@ if (!connectionString) {
 (async () => {
   const pool = new Pool({
     connectionString,
-    ssl: process.env.PGSSLMODE === 'require' || process.env.NODE_ENV === 'production'
+    ssl: process.env.PGSSLMODE === 'require' || process.env.NODE_ENV === 'production' || /sslmode=require/i.test(connectionString)
       ? { rejectUnauthorized: process.env.PGSSL_REJECT_UNAUTHORIZED !== 'false' }
       : false,
   });

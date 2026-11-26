@@ -38,6 +38,7 @@ ALTER TABLE organizations ADD COLUMN IF NOT EXISTS access_code TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS approval_status TEXT NOT NULL DEFAULT 'approved';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS requested_role TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 1;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_global_unique ON users (lower(email));
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_global_unique ON users (lower(username)) WHERE username IS NOT NULL;
 
